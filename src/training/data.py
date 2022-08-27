@@ -286,6 +286,100 @@ class ResampledShards2(IterableDataset):
         for _ in range(self.nshards):
             yield dict(url=self.rng.choice(self.urls))
 
+def preprocess_voxel(voxel):
+    """Preprocess a voxel numpy array to torch."""
+    voxel = torch.from_numpy(voxel)
+    voxel = voxel.float()
+    return voxel
+
+def get_voxel_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False):
+    input_shards = args.train_data if is_train else args.val_data
+    assert input_shards is not None
+    resampled = getattr(args, 'dataset_resampled', False) and is_train
+
+    num_samples, num_shards = get_dataset_size(input_shards)
+    if not num_samples:
+        if is_train:
+            num_samples = args.train_num_samples
+            if not num_samples:
+                raise RuntimeError(
+                    'Currently, number of dataset samples must be specified for training dataset. '
+                    'Please specify via `--train-num-samples` if no dataset length info present.')
+        else:
+            num_samples = args.val_num_samples or 0  # eval will just exhaust the iterator if not specified
+
+    shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
+    if resampled:
+        pipeline = [ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)]
+    else:
+        pipeline = [wds.SimpleShardList(input_shards)]
+
+    # at this point we have an iterator over all the shards
+    if is_train:
+        if not resampled:
+            pipeline.extend([
+                detshuffle2(
+                    bufsize=_SHARD_SHUFFLE_SIZE,
+                    initial=_SHARD_SHUFFLE_INITIAL,
+                    seed=args.seed,
+                    epoch=shared_epoch,
+                ),
+                wds.split_by_node,
+                wds.split_by_worker,
+            ])
+        pipeline.extend([
+            # at this point, we have an iterator over the shards assigned to each worker at each node
+            tarfile_to_samples_nothrow,  # wds.tarfile_to_samples(handler=log_and_continue),
+            wds.shuffle(
+                bufsize=_SAMPLE_SHUFFLE_SIZE,
+                initial=_SAMPLE_SHUFFLE_INITIAL,
+            ),
+        ])
+    else:
+        pipeline.extend([
+            wds.split_by_worker,
+            # at this point, we have an iterator over the shards assigned to each worker
+            wds.tarfile_to_samples(handler=log_and_continue),
+        ])
+
+    pipeline.extend([
+        wds.select(filter_no_caption),
+        wds.decode("pilrgb", "npy", handler=log_and_continue),
+        wds.rename(image="jpg;png", voxel="voxel"),
+        wds.map_dict(image=preprocess_img, voxel=preprocess_voxel),
+        wds.to_tuple("image", "voxel"),
+        wds.batched(args.batch_size, partial=not is_train),
+    ])
+
+    dataset = wds.DataPipeline(*pipeline)
+    if is_train:
+        if not resampled:
+            assert num_shards >= args.workers * args.world_size, 'number of shards must be >= total workers'
+        # roll over and repeat a few samples to get same number of full batches on each node
+        round_fn = math.floor if floor else math.ceil
+        global_batch_size = args.batch_size * args.world_size
+        num_batches = round_fn(num_samples / global_batch_size)
+        num_workers = max(1, args.workers)
+        num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
+        num_batches = num_worker_batches * num_workers
+        num_samples = num_batches * global_batch_size
+        dataset = dataset.with_epoch(num_worker_batches)  # each worker is iterating over this
+    else:
+        # last batches are partial, eval is done on single (master) node
+        num_batches = math.ceil(num_samples / args.batch_size)
+
+    dataloader = wds.WebLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=args.workers,
+        persistent_workers=True,
+    )
+
+    dataloader.num_batches = num_batches
+    dataloader.num_samples = num_samples
+
+    return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
 def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False):
     input_shards = args.train_data if is_train else args.val_data
@@ -420,6 +514,8 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0):
 
 
 def get_dataset_fn(data_path, dataset_type):
+    if dataset_type == "voxel_webdataset":
+        return get_voxel_wds_dataset
     if dataset_type == "webdataset":
         return get_wds_dataset
     elif dataset_type == "csv":

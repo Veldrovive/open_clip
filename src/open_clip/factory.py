@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .model import CLIP, convert_weights_to_fp16, resize_pos_embed
+from .model import CLIP, VoxelCLIP, convert_weights_to_fp16, resize_pos_embed
 from .openai import load_openai_model
 from .pretrained import get_pretrained_url, download_pretrained
 from .transform import image_transform
@@ -73,6 +73,7 @@ def create_model(
         jit: bool = False,
         force_quick_gelu: bool = False,
         pretrained_image: bool = False,
+        voxel_clip: bool = False
 ):
     model_name = model_name.replace('/', '-')  # for callers using old naming with / in ViT names
 
@@ -101,7 +102,10 @@ def create_model(
             else:
                 assert False, 'pretrained image towers currently only supported for timm models'
 
-        model = CLIP(**model_cfg)
+        if voxel_clip:
+            model = VoxelCLIP(**model_cfg)
+        else:
+            model = CLIP(**model_cfg)
         
         if pretrained:
             checkpoint_path = ''
@@ -113,7 +117,7 @@ def create_model(
 
             if checkpoint_path:
                 logging.info(f'Loading pretrained {model_name} weights ({pretrained}).')
-                load_checkpoint(model, checkpoint_path)
+                load_checkpoint(model, checkpoint_path, strict=not voxel_clip)  # Voxel clip wants to load the image encoder, but not the rest of the model. This means we can't load strict=True.
             else:
                 logging.warning(f'Pretrained weights ({pretrained}) not found for model {model_name}.')
                 raise RuntimeError(f'Pretrained weights ({pretrained}) not found for model {model_name}.')
@@ -139,11 +143,14 @@ def create_model_and_transforms(
         pretrained_image: bool = False,
         mean: Optional[Tuple[float, ...]] = None,
         std: Optional[Tuple[float, ...]] = None,
+        voxel_clip: bool = False
 ):
     model = create_model(
         model_name, pretrained, precision, device, jit,
         force_quick_gelu=force_quick_gelu,
-        pretrained_image=pretrained_image)
+        pretrained_image=pretrained_image,
+        voxel_clip=voxel_clip
+    )
     preprocess_train = image_transform(model.visual.image_size, is_train=True, mean=mean, std=std)
     preprocess_val = image_transform(model.visual.image_size, is_train=False, mean=mean, std=std)
     return model, preprocess_train, preprocess_val

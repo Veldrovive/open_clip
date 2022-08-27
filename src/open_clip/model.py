@@ -302,6 +302,26 @@ class VisualTransformer(nn.Module):
 
         return x
 
+class MLP(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, num_layers: int, act_layer: Callable = nn.GELU):
+        super().__init__()
+        input_layer = nn.Linear(input_dim, hidden_dim)
+        output_layer = nn.Linear(hidden_dim, output_dim)
+        layers = [
+            ('input', input_layer),
+            ('gelu1', act_layer())
+        ]
+        for i in range(num_layers - 1):
+            layers.append(('fc{}'.format(i), nn.Linear(hidden_dim, hidden_dim)))
+            layers.append(('gelu{}'.format(i + 2), act_layer()))
+        layers.append(('output', output_layer))
+        self.layers = nn.Sequential(OrderedDict(layers))
+
+    def forward(self, x: torch.Tensor):
+        return self.layers(x)
+
+
+
 
 @dataclass
 class CLIPVisionCfg:
@@ -325,6 +345,113 @@ class CLIPTextCfg:
     heads: int = 8
     layers: int = 12
 
+
+@dataclass
+class CLIPVoxelCfg:
+    voxel_dim: int = 15756
+    layers: int = 1
+    layer_width: int = 512
+
+
+class VoxelCLIP(nn.Module):
+    def __init__(
+            self,
+            embed_dim: int,
+            vision_cfg: CLIPVisionCfg,
+            voxel_cfg: CLIPVoxelCfg,
+            quick_gelu: bool = False,
+    ):
+        super().__init__()
+        if isinstance(vision_cfg, dict):
+            vision_cfg = CLIPVisionCfg(**vision_cfg)
+        if isinstance(text_cfg, dict):
+            text_cfg = CLIPTextCfg(**text_cfg)
+
+        self.context_length = text_cfg.context_length
+
+        # OpenAI models are pretrained w/ QuickGELU but native nn.GELU is both faster and more
+        # memory efficient in recent PyTorch releases (>= 1.10).
+        # NOTE: timm models always use native GELU regardless of quick_gelu flag.
+        act_layer = QuickGELU if quick_gelu else nn.GELU
+
+        if vision_cfg.timm_model_name:
+            self.visual = TimmModel(
+                vision_cfg.timm_model_name,
+                pretrained=vision_cfg.timm_model_pretrained,
+                pool=vision_cfg.timm_pool,
+                proj=vision_cfg.timm_proj,
+                embed_dim=embed_dim,
+                image_size=vision_cfg.image_size
+            )
+            act_layer = nn.GELU  # so that text transformer doesn't use QuickGELU w/ timm models
+        elif isinstance(vision_cfg.layers, (tuple, list)):
+            vision_heads = vision_cfg.width * 32 // vision_cfg.head_width
+            self.visual = ModifiedResNet(
+                layers=vision_cfg.layers,
+                output_dim=embed_dim,
+                heads=vision_heads,
+                image_size=vision_cfg.image_size,
+                width=vision_cfg.width
+            )
+        else:
+            vision_heads = vision_cfg.width // vision_cfg.head_width
+            self.visual = VisualTransformer(
+                image_size=vision_cfg.image_size,
+                patch_size=vision_cfg.patch_size,
+                width=vision_cfg.width,
+                layers=vision_cfg.layers,
+                heads=vision_heads,
+                mlp_ratio=vision_cfg.mlp_ratio,
+                output_dim=embed_dim,
+                act_layer=act_layer,
+            )
+
+        # Basic MLP to test if training is working. Shouldn't overfit at least :p
+        self.voxel_mlp = MLP(
+            input_dim=voxel_cfg.voxel_dim,
+            output_dim=embed_dim,
+            hidden_dim=voxel_cfg.layer_width,
+            num_layers=voxel_cfg.layers,
+            act_layer=act_layer,
+        )
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        self.init_parameters()
+
+    def init_parameters(self):
+        nn.init.constant_(self.logit_scale, np.log(1 / 0.07))
+
+        if hasattr(self.visual, 'init_parameters'):
+            self.visual.init_parameters()
+
+        for fc_layer in self.voxel_mlp.layers:
+            if isinstance(fc_layer, nn.Linear):
+                nn.init.normal_(fc_layer.weight, std=0.02)
+                nn.init.constant_(fc_layer.bias, 0)
+
+    def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
+        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
+        self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
+
+    def encode_image(self, image):
+        return self.visual(image)
+
+    def encode_voxel(self, voxel):
+        return self.voxel_mlp(voxel)
+
+    def forward(self, image, text):
+        if image is None:
+            return self.encode_text(text)
+        elif text is None:
+            return self.encode_image(image)
+        image_features = self.encode_image(image)
+        image_features = F.normalize(image_features, dim=-1)
+
+        text_features = self.encode_text(text)
+        text_features = F.normalize(text_features, dim=-1)
+
+        return image_features, text_features, self.logit_scale.exp()
 
 class CLIP(nn.Module):
     def __init__(

@@ -37,7 +37,7 @@ def random_seed(seed=42, rank=0):
     np.random.seed(seed + rank)
     random.seed(seed + rank)
 
-
+# This is an edit to the training function to substitute out the text encoder for a voxel encoder and freeze the image encoder during training
 def main():
     args = parse_args()
 
@@ -121,6 +121,7 @@ def main():
         jit=args.torchscript,
         force_quick_gelu=args.force_quick_gelu,
         pretrained_image=args.pretrained_image,
+        voxel_clip=args.voxel_clip,
     )
     random_seed(args.seed, args.rank)
 

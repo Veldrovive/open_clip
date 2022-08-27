@@ -281,6 +281,9 @@ def parse_args():
     parser.add_argument(
         "--norm_gradient_clip", type=float, default=None, help="Gradient clip."
     )
+    parser.add_argument(
+        "--voxel-clip", type=bool, default=False, help="Whether to replace the text encoder with a voxel encoder."
+    )
     args = parser.parse_args()
 
     # If some params are not passed, we use the default values based on model name.
