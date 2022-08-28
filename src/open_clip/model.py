@@ -355,19 +355,18 @@ class CLIPVoxelCfg:
 
 class VoxelCLIP(nn.Module):
     def __init__(
-            self,
-            embed_dim: int,
-            vision_cfg: CLIPVisionCfg,
-            voxel_cfg: CLIPVoxelCfg,
-            quick_gelu: bool = False,
+        self,
+        embed_dim: int,
+        vision_cfg: CLIPVisionCfg,
+        voxel_cfg: CLIPVoxelCfg,
+        quick_gelu: bool = False,
+        **kwargs
     ):
         super().__init__()
         if isinstance(vision_cfg, dict):
             vision_cfg = CLIPVisionCfg(**vision_cfg)
-        if isinstance(text_cfg, dict):
-            text_cfg = CLIPTextCfg(**text_cfg)
-
-        self.context_length = text_cfg.context_length
+        if isinstance(voxel_cfg, dict):
+            voxel_cfg = CLIPVoxelCfg(**voxel_cfg)
 
         # OpenAI models are pretrained w/ QuickGELU but native nn.GELU is both faster and more
         # memory efficient in recent PyTorch releases (>= 1.10).
@@ -448,7 +447,7 @@ class VoxelCLIP(nn.Module):
         image_features = self.encode_image(image)
         image_features = F.normalize(image_features, dim=-1)
 
-        text_features = self.encode_text(text)
+        text_features = self.encode_voxel(text)
         text_features = F.normalize(text_features, dim=-1)
 
         return image_features, text_features, self.logit_scale.exp()

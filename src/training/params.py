@@ -38,7 +38,7 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "auto"],
+        choices=["voxel_webdataset", "webdataset", "csv", "auto"],
         default="auto",
         help="Which type of dataset to process."
     )
@@ -282,7 +282,10 @@ def parse_args():
         "--norm_gradient_clip", type=float, default=None, help="Gradient clip."
     )
     parser.add_argument(
-        "--voxel-clip", type=bool, default=False, help="Whether to replace the text encoder with a voxel encoder."
+        "--voxel-clip",
+        default=False,
+        action="store_true",
+        help="Whether to replace the text encoder with a voxel encoder"
     )
     args = parser.parse_args()
 

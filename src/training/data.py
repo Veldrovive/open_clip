@@ -343,9 +343,8 @@ def get_voxel_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False):
         ])
 
     pipeline.extend([
-        wds.select(filter_no_caption),
-        wds.decode("pilrgb", "npy", handler=log_and_continue),
-        wds.rename(image="jpg;png", voxel="voxel"),
+        wds.decode("pilrgb", handler=log_and_continue),
+        wds.rename(image="jpg;png", voxel="voxel.npy", voxel_3d="voxel_3d.npy"),
         wds.map_dict(image=preprocess_img, voxel=preprocess_voxel),
         wds.to_tuple("image", "voxel"),
         wds.batched(args.batch_size, partial=not is_train),

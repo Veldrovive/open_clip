@@ -113,6 +113,7 @@ def main():
         logging.info(f'Running with a single process. Device {args.device}.')
 
     random_seed(args.seed, 0)
+    logging.info(f'Using voxel clip: {args.voxel_clip}')
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
         args.pretrained,

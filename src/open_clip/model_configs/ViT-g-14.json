@@ -14,5 +14,10 @@
         "width": 1024,
         "heads": 16,
         "layers": 24
+    },
+    "voxel_cfg": {
+        "voxel_dim": 15724,
+        "layers": 14,
+        "layer_width": 2048
     }
 }
