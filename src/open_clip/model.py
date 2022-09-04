@@ -6,7 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import math
-from typing import Tuple, Union, Callable, Optional
+from typing import Tuple, List, Union, Callable, Optional
 
 import numpy as np
 import torch
@@ -208,17 +208,17 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, mlp_ratio: float = 4.0, act_layer: Callable = nn.GELU):
+    def __init__(self, d_model: int, n_head: int, mlp_ratio: float = 4.0, act_layer: Callable = nn.GELU, dropout: float = 0.0):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         mlp_width = int(d_model * mlp_ratio)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, mlp_width)),
-            ("gelu", act_layer()),
-            ("c_proj", nn.Linear(mlp_width, d_model))
-        ]))
+        layers = [("c_fc", nn.Linear(d_model, mlp_width))]
+        if dropout > 0.0:
+            layers.append(("c_drop", nn.Dropout(dropout)))
+        layers.extend([("c_act", act_layer()), ("proj", nn.Linear(mlp_width, d_model))])
+        self.mlp = nn.Sequential(OrderedDict(layers))
         self.ln_2 = LayerNorm(d_model)
 
     def attention(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
@@ -231,14 +231,14 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int,  mlp_ratio: float = 4.0, act_layer: Callable = nn.GELU):
+    def __init__(self, width: int, layers: int, heads: int,  mlp_ratio: float = 4.0, act_layer: Callable = nn.GELU, dropout: float = 0.0):
         super().__init__()
         self.width = width
         self.layers = layers
         self.grad_checkpointing = False
 
         self.resblocks = nn.ModuleList([
-            ResidualAttentionBlock(width, heads, mlp_ratio, act_layer=act_layer)
+            ResidualAttentionBlock(width, heads, mlp_ratio, act_layer=act_layer, dropout=dropout)
             for _ in range(layers)
         ])
 
@@ -251,23 +251,69 @@ class Transformer(nn.Module):
         return x
 
 
+class VisualTransformer3d(nn.Module):
+    def __init__(
+        self, space_size: List[int], patch_size: int, width: int, layers: int, heads: int, mlp_ratio: float,
+        output_dim: int, act_layer: Callable = nn.GELU, dropout: float = 0.0
+    ):
+        super().__init__()
+        self.space_size = space_size  # [H, W, D]
+        self.patch_size = patch_size  # [h, w, d]
+        self.grid_size = (space_size[0] // patch_size, space_size[1] // patch_size, space_size[2] // patch_size)
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv3d(1, width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.position_embedding = nn.Parameter(scale * torch.randn(self.grid_size[0] * self.grid_size[1] * self.grid_size[2] + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads, mlp_ratio, act_layer, dropout)
+        
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def forward(self, x: torch.Tensor):
+        tmp = x
+        x = self.conv1(x) # [*, width, grid_size[0], grid_size[1], grid_size[2]]
+        x = x.reshape(x.shape[0], x.shape[1], -1) # [*, width, grid_size[0] * grid_size[1] * grid_size[2]] := [*, width, size]
+        x = x.permute(0, 2, 1) # [*, size, width]
+        x = torch.cat([
+            self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+            x
+        ], dim=1) # [*, size + 1, width]
+        x = x + self.position_embedding.to(x.dtype) # [*, size + 1, width]
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = self.ln_post(x[:, 0, :])
+
+        if self.proj is not None:
+            x = x @ self.proj
+
+        return x
+
 class VisualTransformer(nn.Module):
     def __init__(
             self, image_size: int, patch_size: int, width: int, layers: int, heads: int, mlp_ratio: float,
-            output_dim: int, act_layer: Callable = nn.GELU):
+            output_dim: int, act_layer: Callable = nn.GELU, input_channels: int = 3, dropout: float = 0.0):
         super().__init__()
+        print(f"Transformer of width {width} and {layers} layers with {heads} heads")
         self.image_size = to_2tuple(image_size)
         self.patch_size = to_2tuple(patch_size)
         self.grid_size = (self.image_size[0] // self.patch_size[0], self.image_size[1] // self.patch_size[1])
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn(self.grid_size[0] * self.grid_size[1] + 1, width))
         self.ln_pre = LayerNorm(width)
 
-        self.transformer = Transformer(width, layers, heads, mlp_ratio, act_layer=act_layer)
+        self.transformer = Transformer(width, layers, heads, mlp_ratio, act_layer=act_layer, dropout=dropout)
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
@@ -302,25 +348,144 @@ class VisualTransformer(nn.Module):
 
         return x
 
+class Voxel2DVisualTransformer(VisualTransformer):
+    # Wraps a visual transformer to handle voxel data
+    def __init__(self, image_size: int, channel_dim: int = 2, *args, **kwargs):
+        super().__init__(image_size=image_size, *args, **kwargs)
+        self.channel_dim = channel_dim
+        self.image_size = image_size
+
+    def forward(self, x: torch.Tensor):
+        # x.shape = [*, channel_0, channel_1, channel_2]
+        other_dims = [i+1 for i in filter(lambda x: x != self.channel_dim, [0, 1, 2])]
+        # print(f"Permuted to {(0, self.channel_dim+1, *other_dims)}")
+        x = x.permute(0, self.channel_dim+1, *other_dims) # [*, channel_dim, other_channel_0, other_channel_1]
+        # We also need other_channel_0 and other_channel_1 to be the same size as img_size by padding them with 0s
+        assert x.shape[-1] <= self.image_size, f'Last channel dimension {x.shape[-1]} is larger than image size {self.image_size}'
+        assert x.shape[-2] <= self.image_size, f'Second to last channel dimension {x.shape[-2]} is larger than image size {self.image_size}'
+        channel_1_pad = self.image_size - x.shape[-1]
+        channel_0_pad = self.image_size - x.shape[-2]
+        x = F.pad(x, (0, channel_1_pad, 0, channel_0_pad), mode='constant', value=0) # [*, channel_dim, img_size, img_size]
+        # Now this is in the format for the visual transformer that was defined with input_channels = channel_dim
+        x = super().forward(x)
+        return x
+
+class FlatTransformer(nn.Module):
+    # Takes a flat input of shape [*, 4] where the last dimension is [t, x, y, z] and attends to a 1d conv of t with xyz converted to positional encodings
+    def __init__(
+        self,
+        width: int, layers: int, heads: int, mlp_ratio: float,
+        output_dim: int, act_layer: Callable = nn.GELU, dropout: float = 0.0
+    ):
+        super().__init__()
+        self.width = width
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=width, kernel_size=1, stride=1, bias=False)
+        self.scale = width ** -0.5
+        # self.positional_embedding = nn.Parameter(self.scale * torch.randn(sequence_len, width))
+        self.positional_embedding = nn.Parameter(self.scale * torch.randn(width))
+
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads, mlp_ratio, act_layer=act_layer, dropout=dropout)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(self.scale * torch.randn(width, output_dim))
+
+    def generate_positional_encoding(self, x: torch.Tensor):
+        p_x = x[..., 1]
+        p_y = x[..., 2]
+        p_z = x[..., 3]
+        return self.positional_embedding.repeat(p_x.shape[0], 1)
+
+    def forward(self, x: torch.Tensor):
+        # Extract the dimensions to their own tensors
+        logging.info(f"Input shape: {x.shape}")
+        t = x[..., 0]
+        logging.info(f"t shape: {t.shape}")
+        e = self.conv1(t.unsqueeze(1)) # [*, width, sequence_len]
+        e = e.permute(0, 2, 1) # [*, sequence_len, width]
+        e = e + self.generate_positional_encoding(x)
+        e = self.ln_pre(e)
+
+        e = e.permute(1, 0, 2)  # NLD -> LND
+        logging.info(f"Transformer input shape: {e.shape}")
+        e = self.transformer(e)
+        e = e.permute(1, 0, 2)  # LND -> NLD
+
+        e = self.ln_post(e[:, 0, :])
+
+        if self.proj is not None:
+            logging.info(f"Shape before projection: {e.shape}. Projection shape: {self.proj.shape}")
+            e = e @ self.proj
+        
+        logging.info(f"Output shape: {e.shape}")
+        return e
+
+
+        
+
+# class Voxel3dTransformer(nn.Module):
+#     # Very similar to the vision transformer, but using 3D convolutions instead of 2D convolutions
+#     def __init__(
+#         self, image_size: int, patch_size: int, width: int, layers: int, heads: int, mlp_ratio: float,
+#             output_dim: int, act_layer: Callable = nn.GELU):
+
+# class Voxel3dFlatTransformer(nn.Module):
+#     def __init__(self, width: int, layers: int, heads: int, mlp_ratio: float, output_dim: int, act_layer: Callable = nn.GELU):
+#         pass
+
 class MLP(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, num_layers: int, act_layer: Callable = nn.GELU):
         super().__init__()
         input_layer = nn.Linear(input_dim, hidden_dim)
         output_layer = nn.Linear(hidden_dim, output_dim)
         layers = [
-            ('input', input_layer),
-            ('gelu1', act_layer())
+            ('input', input_layer)
         ]
         for i in range(num_layers - 1):
             layers.append(('fc{}'.format(i), nn.Linear(hidden_dim, hidden_dim)))
             layers.append(('gelu{}'.format(i + 2), act_layer()))
+            layers.append(('dropout{}'.format(i + 2), nn.Dropout(0.3)))
+            layers.append(('ln{}'.format(i + 2), LayerNorm(hidden_dim)))
         layers.append(('output', output_layer))
         self.layers = nn.Sequential(OrderedDict(layers))
 
     def forward(self, x: torch.Tensor):
         return self.layers(x)
 
+class Voxel3dConvEncoder(nn.Module):
+    def __init__(self, dims: List[int], layers: int, output_dim: int, act_layer: Callable = nn.GELU):
+        super().__init__()
+        channels = [1, 32, 64, 64, 32, 32, 32, 32, 32]
+        strides = [1, 1, 2, 1, 1, 1, 2, 1]
+        self.conv_blocks = nn.ModuleList([
+            self._get_conv_layer(channels[i], channels[i + 1], kernel_size=3, stride=strides[i], act_layer=act_layer)
+            for i in range(layers)
+        ])
+        for n in range(layers):
+            stride = strides[n]
+            dialation = 1
+            padding = 0
+            kernel = 3
+            # (d + 2*padding - dialation*(kernel - 1) - 1)/(stride) + 1
+            dims = [int((d + 2*padding - dialation*(kernel - 1) - 1)/(stride) + 1) for d in dims]
+        logging.info(f"Expected output shape: {dims}")
+        self.mlp = MLP(channels[layers] * dims[0] * dims[1] * dims[2], output_dim, hidden_dim=output_dim*4, num_layers=3)
+        
+    def _get_conv_layer(self, c_in, c_out, kernel_size, stride, act_layer):
+        return nn.Sequential(
+            nn.Conv3d(c_in, c_out, kernel_size=kernel_size, stride=stride),
+            nn.Dropout3d(0.1),
+            act_layer(),
+            # nn.MaxPool3d(kernel_size=2, stride=2)
+        )
 
+    def forward(self, x: torch.Tensor):
+        for block in self.conv_blocks:
+            x = block(x)
+        # logging.info(f"Actual output shape: {x.shape}")
+        x = x.view(x.shape[0], -1)
+        return self.mlp(x)
 
 
 @dataclass
@@ -345,12 +510,41 @@ class CLIPTextCfg:
     heads: int = 8
     layers: int = 12
 
-
-@dataclass
-class CLIPVoxelCfg:
+@dataclass 
+class CLIPMlpVoxelCfg:
     voxel_dim: int = 15756
     layers: int = 1
     layer_width: int = 512
+
+@dataclass
+class CLIP3dConvNetCfg:
+    dims: List[int] = None
+    layers: int = 1
+
+@dataclass
+class CLIPVoxelTransformerCfg:
+    width: int = 768
+    layers: int = 12
+    heads: int = 8
+
+@dataclass
+class CLIPVoxelVisualTransformerCfg:
+    channel_dim: int = 2
+    channels: int = 61
+    image_size: int = 46
+    layers: int = 8
+    width: int = 2048
+    head_width: int = 12
+    mlp_ratio: float = 4.3637
+    patch_size: int = 3
+
+@dataclass
+class CLIPVoxelCfg:
+    config_mlp: CLIPMlpVoxelCfg = None
+    config_2d_visual_transformer: CLIPVoxelVisualTransformerCfg = None
+    config_3d_conv: CLIP3dConvNetCfg = None
+    config_3d_transformer: CLIPVoxelTransformerCfg = None
+    
 
 
 class VoxelCLIP(nn.Module):
@@ -360,6 +554,7 @@ class VoxelCLIP(nn.Module):
         vision_cfg: CLIPVisionCfg,
         voxel_cfg: CLIPVoxelCfg,
         quick_gelu: bool = False,
+        voxel_type: str = "flat",
         **kwargs
     ):
         super().__init__()
@@ -405,14 +600,73 @@ class VoxelCLIP(nn.Module):
                 act_layer=act_layer,
             )
 
-        # Basic MLP to test if training is working. Shouldn't overfit at least :p
-        self.voxel_mlp = MLP(
-            input_dim=voxel_cfg.voxel_dim,
-            output_dim=embed_dim,
-            hidden_dim=voxel_cfg.layer_width,
-            num_layers=voxel_cfg.layers,
-            act_layer=act_layer,
-        )
+        logging.info(f"Generating model with voxel type {voxel_type}")
+        self.voxel_type = voxel_type
+        if voxel_type == "mlp":
+            assert voxel_cfg.config_mlp is not None, "config_mlp is required for voxel_type=flat"
+            # Basic MLP to test if training is working. Shouldn't overfit at least :p
+            self.voxel_encoder = MLP(
+                input_dim=voxel_cfg.config_mlp["voxel_dim"],
+                output_dim=embed_dim,
+                hidden_dim=voxel_cfg.config_mlp["layer_width"],
+                num_layers=voxel_cfg.config_mlp["layers"],
+                act_layer=act_layer,
+            )
+        elif voxel_type == "3d-conv":
+            assert voxel_cfg.config_3d_conv is not None, "config_3d_conv is required for voxel_type=3d"
+            # Uses a 3D convolutional network to encode voxel data.
+            # raise NotImplementedError("3D voxel encoder not implemented")
+            self.voxel_encoder = Voxel3dConvEncoder(
+                dims=voxel_cfg.config_3d_conv["dims"],
+                layers=voxel_cfg.config_3d_conv["layers"],
+                output_dim=embed_dim,
+                act_layer=act_layer,
+            )
+        elif voxel_type == "3d-vision-transformer": 
+            # Uses the visual transformer with a large channel dimension to encode voxel data.
+            assert voxel_cfg.config_2d_visual_transformer is not None, "config_2d_visual_transformer is required for voxel_type=3d"
+            vision_heads = voxel_cfg.config_2d_visual_transformer["width"] // voxel_cfg.config_2d_visual_transformer["head_width"]
+            self.voxel_encoder = Voxel2DVisualTransformer(
+                image_size=voxel_cfg.config_2d_visual_transformer["image_size"],
+                patch_size=voxel_cfg.config_2d_visual_transformer["patch_size"],
+                width=voxel_cfg.config_2d_visual_transformer["width"],
+                layers=voxel_cfg.config_2d_visual_transformer["layers"],
+                heads=vision_heads,
+                mlp_ratio=voxel_cfg.config_2d_visual_transformer["mlp_ratio"],
+                output_dim=embed_dim,
+                act_layer=act_layer,
+                input_channels=voxel_cfg.config_2d_visual_transformer["channels"],
+                channel_dim=voxel_cfg.config_2d_visual_transformer["channel_dim"],
+                dropout=0.2
+            )
+        elif voxel_type == "3d-transformer":
+            assert voxel_cfg.config_3d_transformer is not None, "config_3d_transformer is required for voxel_type=3d"
+            # Uses a transformer to encode voxel data.
+            # raise NotImplementedError("3D flat voxel encoder not implemented")
+            self.voxel_encoder = VisualTransformer3d(
+                space_size=[42, 46, 61],
+                patch_size=8,
+                width=1408,
+                layers=14,
+                heads=8,
+                mlp_ratio=4.3637,
+                output_dim=embed_dim,
+                act_layer=act_layer,
+                dropout=0.4
+            )
+        elif voxel_type == "flat-transformer":
+            # assert voxel_cfg.config_flat_transformer is not None, "config_flat_transformer is required for voxel_type=flat-transformer"
+            self.voxel_encoder = FlatTransformer(
+                width=512,
+                layers=4,
+                heads=8,
+                mlp_ratio=4,
+                output_dim=embed_dim,
+                act_layer=act_layer,
+                dropout=0.4
+            )
+        else:
+            raise ValueError("Invalid voxel type: {}".format(voxel_type))
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -424,10 +678,16 @@ class VoxelCLIP(nn.Module):
         if hasattr(self.visual, 'init_parameters'):
             self.visual.init_parameters()
 
-        for fc_layer in self.voxel_mlp.layers:
-            if isinstance(fc_layer, nn.Linear):
-                nn.init.normal_(fc_layer.weight, std=0.02)
-                nn.init.constant_(fc_layer.bias, 0)
+        if self.voxel_type == "flat":
+            for fc_layer in self.voxel_encoder.layers:
+                if isinstance(fc_layer, nn.Linear):
+                    nn.init.normal_(fc_layer.weight, std=0.02)
+                    nn.init.constant_(fc_layer.bias, 0)
+        elif self.voxel_type == "3d":
+            # raise NotImplementedError("3D voxel encoder initializer not implemented")
+            pass
+        elif self.voxel_type == "3d-flat":
+            raise NotImplementedError("3D flat voxel encoder initializer not implemented")
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -437,7 +697,7 @@ class VoxelCLIP(nn.Module):
         return self.visual(image)
 
     def encode_voxel(self, voxel):
-        return self.voxel_mlp(voxel)
+        return self.voxel_encoder(voxel)
 
     def forward(self, image, text):
         if image is None:

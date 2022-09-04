@@ -73,8 +73,9 @@ def create_model(
         jit: bool = False,
         force_quick_gelu: bool = False,
         pretrained_image: bool = False,
-        voxel_clip: bool = False
+        voxel_clip: str = "none"
 ):
+    logging.info("In create_model")
     model_name = model_name.replace('/', '-')  # for callers using old naming with / in ViT names
 
     if pretrained.lower() == 'openai':
@@ -102,9 +103,12 @@ def create_model(
             else:
                 assert False, 'pretrained image towers currently only supported for timm models'
 
-        if voxel_clip:
-            model = VoxelCLIP(**model_cfg)
+        logging.info("Creating model...")
+        if voxel_clip != "none":
+            logging.info(f"Using voxel clip mode {voxel_clip}")
+            model = VoxelCLIP(**model_cfg, voxel_type=voxel_clip)
         else:
+            logging.info("Not using voxel clip")
             model = CLIP(**model_cfg)
         
         if pretrained:
@@ -143,8 +147,9 @@ def create_model_and_transforms(
         pretrained_image: bool = False,
         mean: Optional[Tuple[float, ...]] = None,
         std: Optional[Tuple[float, ...]] = None,
-        voxel_clip: bool = False
+        voxel_clip: str = "none"
 ):
+    logging.info("In create_model_and_transforms")
     model = create_model(
         model_name, pretrained, precision, device, jit,
         force_quick_gelu=force_quick_gelu,

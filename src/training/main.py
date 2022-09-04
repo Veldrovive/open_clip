@@ -124,6 +124,7 @@ def main():
         pretrained_image=args.pretrained_image,
         voxel_clip=args.voxel_clip,
     )
+    logging.info("Created model.")
     random_seed(args.seed, args.rank)
 
     if args.trace:

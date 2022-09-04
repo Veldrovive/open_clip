@@ -1,5 +1,6 @@
 import ast
 import json
+from locale import normalize
 import logging
 import math
 import os
@@ -292,6 +293,127 @@ def preprocess_voxel(voxel):
     voxel = voxel.float()
     return voxel
 
+def preprocess_voxel_3d(voxel, demean=True, normalize=True, create_intensity_dimension=True, flatten=True, use_prop_dimension=False):
+    """
+    The voxel array is a 3d array of shape (x, y, z) with values being intensity.
+    If normalize, we take the mean to 0 and the variance to 1.
+    If flatten, we take all non-zero values in the array and put them into a new array of shape (n, 4) where n
+        is the number of non-zero entries and the last dimension is (intensity, x, y, z).
+    """
+    if demean:
+        voxel = voxel - int(voxel.mean())
+    elif normalize:
+        voxel = voxel - voxel.mean()
+        voxel = voxel / voxel.std()
+    if flatten:
+        new_list = []
+        for x in range(voxel.shape[0]):
+            for y in range(voxel.shape[1]):
+                for z in range(voxel.shape[2]):
+                    if voxel[x, y, z] != 0:
+                        if use_prop_dimension:
+                            new_list.append([voxel[x, y, z], x / voxel.shape[0], y / voxel.shape[1], z / voxel.shape[2]])
+                        else:
+                            new_list.append([voxel[x, y, z], x, y, z])
+        voxel = np.array(new_list)
+    elif create_intensity_dimension:
+        # Then we need to take this from (X, Y, Z) to (1, X, Y, Z) for the convolutional layer.
+        voxel = voxel[np.newaxis, :]
+    # convert to torch
+    voxel = torch.from_numpy(voxel)
+    voxel = voxel.float()
+    return voxel
+
+def get_3d_voxel_wds_dataset_with_preprocess_args(**preprocess_args):
+    def get_3d_voxel_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False):
+        input_shards = args.train_data if is_train else args.val_data
+        assert input_shards is not None
+        resampled = getattr(args, 'dataset_resampled', False) and is_train
+
+        num_samples, num_shards = get_dataset_size(input_shards)
+        if not num_samples:
+            if is_train:
+                num_samples = args.train_num_samples
+                if not num_samples:
+                    raise RuntimeError(
+                        'Currently, number of dataset samples must be specified for training dataset. '
+                        'Please specify via `--train-num-samples` if no dataset length info present.')
+            else:
+                num_samples = args.val_num_samples or 0  # eval will just exhaust the iterator if not specified
+
+        shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
+        if resampled:
+            pipeline = [ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)]
+        else:
+            pipeline = [wds.SimpleShardList(input_shards)]
+
+        # at this point we have an iterator over all the shards
+        if is_train:
+            if not resampled:
+                pipeline.extend([
+                    detshuffle2(
+                        bufsize=_SHARD_SHUFFLE_SIZE,
+                        initial=_SHARD_SHUFFLE_INITIAL,
+                        seed=args.seed,
+                        epoch=shared_epoch,
+                    ),
+                    wds.split_by_node,
+                    wds.split_by_worker,
+                ])
+            pipeline.extend([
+                # at this point, we have an iterator over the shards assigned to each worker at each node
+                tarfile_to_samples_nothrow,  # wds.tarfile_to_samples(handler=log_and_continue),
+                wds.shuffle(
+                    bufsize=_SAMPLE_SHUFFLE_SIZE,
+                    initial=_SAMPLE_SHUFFLE_INITIAL,
+                ),
+            ])
+        else:
+            pipeline.extend([
+                wds.split_by_worker,
+                # at this point, we have an iterator over the shards assigned to each worker
+                wds.tarfile_to_samples(handler=log_and_continue),
+            ])
+
+        pipeline.extend([
+            wds.decode("pilrgb", handler=log_and_continue),
+            wds.rename(image="jpg;png", voxel="voxel.npy", voxel_3d="voxel_3d.npy"),
+            wds.map_dict(image=preprocess_img, voxel_3d=lambda voxel: preprocess_voxel_3d(voxel, **preprocess_args)),
+            wds.to_tuple("image", "voxel_3d"),
+            wds.batched(args.batch_size, partial=not is_train),
+        ])
+
+        dataset = wds.DataPipeline(*pipeline)
+        if is_train:
+            if not resampled:
+                assert num_shards >= args.workers * args.world_size, 'number of shards must be >= total workers'
+            # roll over and repeat a few samples to get same number of full batches on each node
+            round_fn = math.floor if floor else math.ceil
+            global_batch_size = args.batch_size * args.world_size
+            num_batches = round_fn(num_samples / global_batch_size)
+            num_workers = max(1, args.workers)
+            num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
+            num_batches = num_worker_batches * num_workers
+            num_samples = num_batches * global_batch_size
+            dataset = dataset.with_epoch(num_worker_batches)  # each worker is iterating over this
+        else:
+            # last batches are partial, eval is done on single (master) node
+            num_batches = math.ceil(num_samples / args.batch_size)
+
+        dataloader = wds.WebLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=args.workers,
+            persistent_workers=True,
+        )
+
+        dataloader.num_batches = num_batches
+        dataloader.num_samples = num_samples
+
+        return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
+    return get_3d_voxel_wds_dataset
+
 def get_voxel_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False):
     input_shards = args.train_data if is_train else args.val_data
     assert input_shards is not None
@@ -513,6 +635,14 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0):
 
 
 def get_dataset_fn(data_path, dataset_type):
+    if dataset_type == "3d_voxels_as_image_webdataset":
+        return get_3d_voxel_wds_dataset_with_preprocess_args(flatten=False, normalize=True, create_intensity_dimension=False)
+    if dataset_type == "3d_flat_voxel_webdataset":
+        return get_3d_voxel_wds_dataset_with_preprocess_args(flatten=True, normalize=True)
+    if dataset_type == "3d_voxel_2d_transformer_webdataset":
+        return get_3d_voxel_wds_dataset_with_preprocess_args(flatten=False, normalize=True)
+    if dataset_type == "3d_voxel_webdataset":
+        return get_3d_voxel_wds_dataset_with_preprocess_args(flatten=False, normalize=True, create_intensity_dimension=True)
     if dataset_type == "voxel_webdataset":
         return get_voxel_wds_dataset
     if dataset_type == "webdataset":

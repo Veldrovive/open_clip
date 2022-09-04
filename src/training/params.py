@@ -38,7 +38,7 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["voxel_webdataset", "webdataset", "csv", "auto"],
+        choices=["3d_voxels_as_image_webdataset", "3d_flat_voxel_webdataset", "3d_voxel_webdataset", "voxel_webdataset", "webdataset", "csv", "auto"],
         default="auto",
         help="Which type of dataset to process."
     )
@@ -283,8 +283,8 @@ def parse_args():
     )
     parser.add_argument(
         "--voxel-clip",
-        default=False,
-        action="store_true",
+        default="none",
+        choices=["none", "mlp", "3d-conv", "3d-transformer", "3d-vision-transformer", "flat-transformer"],
         help="Whether to replace the text encoder with a voxel encoder"
     )
     args = parser.parse_args()
