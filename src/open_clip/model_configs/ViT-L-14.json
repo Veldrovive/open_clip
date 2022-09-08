@@ -12,5 +12,31 @@
         "width": 768,
         "heads": 12,
         "layers": 12
+    },
+    "voxel_cfg": {
+        "config_mlp": {
+            "voxel_dim": 15724,
+            "layers": 8,
+            "layer_width": 2048
+        },
+        "config_3d_conv": {
+            "dims": [42, 46, 61],
+            "layers": 8
+        },
+        "config_2d_visual_transformer": {
+            "channel_dim": 2,
+            "channels": 61,
+            "image_size": 46,
+            "layers": 12,
+            "width": 1408,
+            "head_width": 88,
+            "mlp_ratio": 4.3637,
+            "patch_size": 3
+        },
+        "config_3d_transformer": {
+            "width": 1024,
+            "heads": 8,
+            "layers": 8
+        }
     }
 }
