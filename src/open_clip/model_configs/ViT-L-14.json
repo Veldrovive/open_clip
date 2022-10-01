@@ -21,7 +21,8 @@
         },
         "config_3d_conv": {
             "dims": [42, 46, 61],
-            "layers": 8
+            "layers": 8,
+            "vocab_size": 4900
         },
         "config_2d_visual_transformer": {
             "channel_dim": 2,

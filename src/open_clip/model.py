@@ -509,7 +509,7 @@ class ClassVoxel3dConvEncoder(nn.Module):
         return x
 
 class NewVoxel3dConvEncoder(nn.Module):
-    def __init__(self, dims: List[int], attention_width: int, output_dim: int, average_output: bool = False, act_layer: Callable = nn.GELU):
+    def __init__(self, dims: List[int], attention_width: int, output_dim: int, c_in: int = 1, average_output: bool = False, act_layer: Callable = nn.GELU):
         super().__init__()
         self.average_output = average_output  # Average the output of the transformer instead of using a flattened linear layer
         self.channels = [64, 128, 256, 256, 256, attention_width]
@@ -518,7 +518,7 @@ class NewVoxel3dConvEncoder(nn.Module):
         self.dialation = [1, 1, 1, 1, 1, 1]
         self.kernel = [3, 3, 3, 3, 3, 3]
         assert len(self.channels) == len(self.strides) == len(self.padding) == len(self.dialation) == len(self.kernel), f"Lengths of channels, strides, padding, dialation, and kernel must be the same. Got {len(self.channels)}, {len(self.strides)}, {len(self.padding)}, {len(self.dialation)}, {len(self.kernel)}"
-        channels = [1] + self.channels
+        channels = [c_in] + self.channels
         self.conv_blocks = nn.ModuleList([
             self._get_conv_layer(channels[i], channels[i + 1], kernel_size=self.kernel[i], stride=self.strides[i], padding=self.padding[i], dilation=self.dialation[i], act_layer=act_layer)
             for i in range(len(self.channels))
@@ -561,6 +561,17 @@ class NewVoxel3dConvEncoder(nn.Module):
             x = x.reshape(x.shape[0], -1) # [*, attention_width * seq_len]
             x = self.proj(x)
         return x
+
+class EmbeddingVoxel3dConvEncoder(NewVoxel3dConvEncoder):
+    # Same as NewVoxel3dConvEncoder but with an embedding layer to take the value at [*, w, h, d] and blow it up into [*, w, h, d, c_in]
+    def __init__(self, vocab_size: int, dims: List[int], attention_width: int, output_dim: int, c_in: int = 64, average_output: bool = False, act_layer: Callable = nn.GELU):
+        super().__init__(dims, attention_width, output_dim, c_in, average_output, act_layer)
+        self.token_embedding = nn.Embedding(vocab_size, c_in)
+
+    def forward(self, x: torch.Tensor):
+        # x: [*, w, h, d]
+        x = self.token_embedding(x) # [*, w, h, d, c_in]
+        return super().forward(x)
 
 # class Voxel3dConvEncoder(nn.Module):
 #     def __init__(self, dims: List[int], layers: int, output_dim: int, act_layer: Callable = nn.GELU):
@@ -778,6 +789,18 @@ class VoxelCLIP(nn.Module):
             #     output_dim=embed_dim,
             #     act_layer=act_layer
             # )
+        elif voxel_type == "embedding-3d-conv":
+            assert voxel_cfg.config_3d_conv is not None, "config_3d_conv is required for voxel_type=3d"
+            # This is exactly the same as 3d-conv, except that instead of expecting an input of [*, w, h, d, c_in], we expect [*, w, h, d] with an integer class as the value
+            # We then have one pre-processing step before passing to the 3d-conv where we use an nn.Embedding layer to convert the integer class to a vector of size c_in
+            self.voxel_encoder = EmbeddingVoxel3dConvEncoder(
+                dims=voxel_cfg.config_3d_conv["dims"],
+                attention_width=64,
+                c_in=64,
+                vocab_size=voxel_cfg.config_3d_conv["vocab_size"],
+                output_dim=embed_dim,
+                act_layer=act_layer
+            )
         elif voxel_type == "3d-vision-transformer": 
             # Uses the visual transformer with a large channel dimension to encode voxel data.
             assert voxel_cfg.config_2d_visual_transformer is not None, "config_2d_visual_transformer is required for voxel_type=3d"
